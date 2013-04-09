@@ -1,0 +1,304 @@
+#!/usr/bin/env python
+
+"""
+
+Parse Apache extended status (http://localhost/server-status) and 
+print results, suitable for commandline scripts.
+
+Examples:
+
+Show all process that have been busy for at least 2 minutes with the 
+current request and are in R(eading) state
+
+    apachetop --mintime 120 --state R
+
+Show all active Apache processes and reverse sort based on request 
+duration.
+ 
+    apachetop | sort -nk4
+
+Kill all processes that are running for longer than 2 minutes:
+
+    apachetop --mintime 120 --kill
+
+Find longest running apache procs on all web and app servers and 
+sort on duration
+
+    pboxes -f web,app  --ssh "apachetop --mintime 600" | sort -nk7
+
+Find all "graciously closing" procs, that will probably never ever 
+close. Kill them
+
+    apachetop --state G --mintime 120 --kill
+
+Kill all connections occupied by Chinese with crappy bandwidth.
+
+    apachetop --state R  --mintime 10 --kill
+
+Kill everything with request time > 20 sec, if total amount of 
+active procs is > 120.
+
+    apachetop --kill --mintime 10 --minprocs 120
+
+Find all procs that are sending data, sorted on number of procs per 
+site.
+
+    pboxes -f app --ssh "apachetop --state W" | awk '{ print $13; }' |\
+        sort | uniq -c | sort -n
+
+Emergency measure to keep a hammered box alive, The -E only sends 
+mail if the message body is non-empty
+
+    while (sleep 5); 
+    do
+        apachetop --mintime 20 --minprocs 140 --kill |\
+            mail -E -s "apache killer @ BU.com" gwillem@byte.nl; 
+    done
+
+Original author: willem@byte.nl // 20130329
+
+"""
+
+import operator
+import urllib
+import optparse
+import os # for os.kill
+import sys # for sys.exit
+
+from HTMLParser import HTMLParser
+
+class ApacheStatusParser(HTMLParser):
+    """
+    Parse raw Apache extended server-status 
+    
+    Stolen from https://raw.github.com/fr3nd/apache-top/master/apache-top.py
+    """
+
+    performance_info = 2
+    scoreboard = 3
+    proceses = 4
+
+    status = 0
+
+    store = False # defineix si el contingut s'ha de guardar o no
+    append = False # defineix si els seguents caracters s'han d'afegir o posar en un altre camp
+
+    performance_info_data = []
+    scoreboard_data = []
+    proceses_data = []
+
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.performance_info_data = []
+        self.scoreboard_data = []
+        self.proceses_data = []
+        self.store = False
+        self.append = False
+        self.status = 1
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "b":
+            return
+        self.store = False
+        if self.status <= self.performance_info:
+            if tag == "dt":
+                self.store = True
+        elif self.status <= self.scoreboard:
+            if tag == "pre":
+                self.store = True
+        elif self.status <= self.proceses:
+            if tag == "tr":
+                #if len(self.proceses_data[-1]) != 0:
+                if len (self.proceses_data) == 0:
+                    self.proceses_data.append([])
+                else:
+                    if len(self.proceses_data[-1]) > 0:
+                        self.proceses_data.append([])
+
+            elif tag == "td":
+                self.store = True
+
+    def handle_endtag(self, tag):
+        if tag == "b":
+            return
+        self.store = False
+        self.append = False
+        if self.status <= self.performance_info and tag == "dl":
+            self.status += 1
+        elif self.status <= self.scoreboard and tag == "pre":
+            self.status += 1
+        elif self.status <= self.proceses and tag == "table":
+            self.status += 1
+
+    def handle_data(self,data):
+        if self.store and data != "\n":
+            if self.status <= self.performance_info:
+                self.performance_info_data.append(data.replace("\n",""))
+            elif self.status <= self.scoreboard:
+                self.scoreboard_data.append(data.replace("\n",""))
+            elif self.status <= self.proceses:
+                if not self.append:
+                    self.proceses_data[-1].append(data.replace("\n",""))
+                else:
+                    self.proceses_data[-1][-1] += data.replace("\n","")
+
+    def handle_charref(self, ref):
+        self.append = True
+        self.handle_data("&#%s;" % ref)
+
+    def handle_entityref(self, ref):
+        self.append = True
+        self.handle_data("&%s;" % ref)
+
+    def eval_data(self):
+        for process in self.proceses_data:
+            # PID
+            try:
+                process[1] = eval(process[1])
+            except:
+                process[1] = 0
+            # Acc Number of accesses this connection / this child / this slot
+            process[2] = process[2].split("/")
+            process[2][0] = eval(process[2][0])
+            process[2][1] = eval(process[2][1])
+            process[2][2] = eval(process[2][2])
+            # M Mode of operation
+            #pass
+            # CPU CPU usage, number of seconds
+            process[4] = eval(process[4])
+            # SS Seconds since beginning of most recent request
+            process[5] = eval(process[5])
+            # Req Milliseconds required to process most recent request
+            process[6] = eval(process[6])
+            # Conn Kilobytes transferred this connection
+            process[7] = eval(process[7])
+            # Child Megabytes transferred this child
+            process[8] = eval(process[8])
+            # Slot Total megabytes transferred this slot
+            process[9] = eval(process[9])
+
+class ApacheStatusTool():
+    """ Common functions for a commandline tool to display and control Apache processes """
+    
+    def __init__(self):
+        self.options = self.parse_options()
+
+    def load(self):
+        """ Load and filter the extended status from localhost """
+        self.procs = self.filter_procs(
+            self.parse_live_status()
+        )
+    
+    def display(self):
+        for i in self.procs:
+            msg = self.proc_to_string(i)
+            try:
+                print msg
+            except IOError: # apachetop | head
+                sys.exit("whoops! ioerror")
+        
+    def control(self):
+        """ Kill the Apache processes that have been filtered """
+            
+        for proc in self.procs:
+            os.kill(proc[1],9)
+        
+
+    def parse_options(self):
+        
+        def safety_net_for_kill(option, opt_str, value, parser):
+            if not (parser.values.mintime or parser.values.state):
+                raise optparse.OptionValueError("I will not kill without filter options")
+            setattr(parser.values, option.dest, True)
+        
+        parser = optparse.OptionParser()
+
+        parser.add_option("--quiet", dest="quiet", action="store_true", default=False,
+            help="don't show output (default: False)", )
+
+        parser.add_option("--mintime", dest="mintime", type="int",
+            help="only show requests running longer than NUM sec", metavar="NUM" )
+
+        parser.add_option("--state", dest="state", metavar="CHAR", choices=['R','C','G','W','_'],
+            help="only show procs in state STATE (can be R,C,G,W,_)",)
+
+        parser.add_option("--minprocs", dest="minprocs", type="int", default=0, metavar="NUM",
+            help="only act when at least NUM apache slots are active (def: 0)", )
+
+        parser.add_option("--kill", dest="kill", action="callback", default=False,
+            help="kill the selected apache processes", callback=safety_net_for_kill)
+
+        (options, args) = parser.parse_args()
+        return options        
+    
+
+    def parse_status(self, statusdata):
+
+        data = ApacheStatusParser()
+
+        data.feed(statusdata)
+        data.eval_data()
+        
+        #~ active = [proc for proc in data.proceses_data if proc[3] != '.']
+        active = sorted(data.proceses_data, key=operator.itemgetter(5), reverse=True)
+
+        #~ print time.ctime(), "Found %d apache procs" % len(active)
+
+        #~ print self.options
+
+        return active
+
+        #~ if len(active) < PROCESS_THRESHOLD:
+            #~ return
+    
+    def filter_procs(self,procs):
+        
+        filtered = []
+        
+        for proc in procs:
+            
+            status = proc[3]
+            url    = proc[12]
+            secs   = proc[5]
+            pid    = proc[1]
+            
+            # ignore non-active slots
+            if status == '.':
+                continue
+            
+            if self.options.state and self.options.state != status:
+                continue
+            
+            if self.options.mintime < secs:
+                filtered.append(proc)
+            
+        return filtered
+        
+    def parse_live_status(self, url='http://localhost/server-status'):
+        return self.parse_status(urllib.urlopen(url).read())
+
+    def proc_to_string(self,proc):
+        return "pid %6d sec %3d state %1s client %-15s host %-30s uri %s" % (int(proc[1]), int(proc[5]), proc[3], proc[10], proc[11], proc[12])
+
+
+
+if __name__ == '__main__':
+    
+    tool = ApacheStatusTool()
+
+    tool.load()
+    
+    if len(tool.procs) < tool.options.minprocs:
+        if sys.stdout.isatty():
+            sys.exit("Number of active Apache procs (%d) is less than --minprocs (%d), quitting" % 
+                (len(tool.procs), tool.options.minprocs))
+        else:
+            sys.exit(0)
+    
+    if not tool.options.quiet:
+        tool.display()
+
+    if tool.options.kill:
+        tool.control()
+
+
