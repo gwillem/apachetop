@@ -186,7 +186,7 @@ class ApacheStatusTool():
     def load(self):
         """ Load and filter the extended status from localhost """
         self.procs = self.filter_procs(
-            self.parse_live_status()
+            self.parse_live_status('http://%s/server-status' % (self.options.host,))
         )
     
     def display(self):
@@ -219,14 +219,21 @@ class ApacheStatusTool():
         parser.add_option("--mintime", dest="mintime", type="int",
             help="only show requests running longer than NUM sec", metavar="NUM" )
 
-        parser.add_option("--state", dest="state", metavar="CHAR", choices=['R','C','G','W','_'],
-            help="only show procs in state STATE (can be R,C,G,W,_)",)
+        state_choices = ['R','C','G','W','_', 'K', 'D', 'L']
+        parser.add_option("--state", dest="state", metavar="CHAR", choices=state_choices,
+            help="only show procs in state STATE (%s)" % ('|'.join(state_choices)),)
 
         parser.add_option("--minprocs", dest="minprocs", type="int", default=0, metavar="NUM",
             help="only act when at least NUM apache slots are active (def: 0)", )
 
         parser.add_option("--kill", dest="kill", action="callback", default=False,
             help="kill the selected apache processes", callback=safety_net_for_kill)
+
+        parser.add_option("--host", dest="host", default='localhost',
+            help="hostname for mod_status")
+
+        parser.add_option("--idle", dest="idle", action="store_true", default=False,
+            help="show workers marked idle (default: False)", )
 
         (options, args) = parser.parse_args()
         return options        
@@ -265,6 +272,9 @@ class ApacheStatusTool():
             # ignore non-active slots
             if status == '.':
                 continue
+
+            if not self.options.idle and status == '_':
+                continue
             
             if self.options.state and self.options.state != status:
                 continue
@@ -273,8 +283,8 @@ class ApacheStatusTool():
                 filtered.append(proc)
             
         return filtered
-        
-    def parse_live_status(self, url='http://localhost/server-status'):
+
+    def parse_live_status(self, url):
         return self.parse_status(urllib.urlopen(url).read())
 
     def proc_to_string(self,proc):
@@ -286,7 +296,11 @@ if __name__ == '__main__':
     
     tool = ApacheStatusTool()
 
-    tool.load()
+    try:
+        tool.load()
+    except IOError:
+        sys.stderr.write("Failed to read from %s\n" % (tool.options.host,))
+        sys.exit(1)
     
     if len(tool.procs) < tool.options.minprocs:
         if sys.stdout.isatty():
